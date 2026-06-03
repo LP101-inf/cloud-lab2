@@ -1,57 +1,41 @@
 # Zadanie 2 – Pipeline CI/CD z wieloarchitekturą i testem CVE
 
-## Opis rozwiązania
-Pipeline GitHub Actions automatycznie buduje obraz kontenera dla dwóch architektur (`linux/amd64`, `linux/arm64`), wykorzystuje cache warstw przechowywany w publicznym repozytorium DockerHub, a następnie skanuje obraz narzędziem **Trivy** w poszukiwaniu krytycznych i wysokich podatności. Tylko bezpieczny obraz jest publikowany w rejestrze `ghcr.io`.
+Pipeline w GitHub Actions buduje obraz kontenera z kodem źródłowym z zadania 1 dla dwóch architektur: linux/amd64 i linux/arm64. Wykorzystuje cache na DockerHubie, a przed publikacją w ghcr.io skanuje obraz narzędziem Trivy. Jeśli zostaną znalezione podatności o poziomie krytycznym lub wysokim, obraz nie zostanie wypchnięty.
 
----
+## Tagowanie obrazów
 
-### Sposób tagowania obrazów
-Przyjęto następującą konwencję tagowania (realizowaną przez akcję `docker/metadata-action`):
+Obraz otrzymuje trzy typy tagów:
+- **latest** – zawsze wskazuje najnowszy obraz zbudowany z gałęzi main. Dzięki temu można łatwo pobrać ostatnią działającą wersję.
+- **sha-xxxxxxx** (np. sha-1a2b3c4) – tag oparty na krótkim identyfikatorze commita. Jest niezmienny i pozwala jednoznacznie powiązać obraz z konkretnym punktem w historii repozytorium.
+- **vX.Y.Z** – tworzony automatycznie, gdy wypchnięty zostanie tag git (wydanie). Ułatwia śledzenie wersji.
 
-- **`latest`** – zawsze wskazuje ostatni obraz zbudowany z gałęzi `main`. Ułatwia szybkie pobranie najnowszej stabilnej wersji.
-- **`sha-<krótki_skrót>`** (np. `sha-1a2b3c4`) – jednoznacznie identyfikuje obraz z konkretnym commitem. Zapewnia pełną powtarzalność i audytowalność.
-- **`vX.Y.Z`** – tag tworzony automatycznie przy wypchnięciu tagu Git (wydania). Pozwala na semantyczne wersjonowanie.
+Takie podejście łączy wygodę (latest) z powtarzalnością i bezpieczeństwem (sha, tagi wydań). Rezygnuję z tagów opartych na nazwach gałęzi, żeby nie zaśmiecać rejestru niepotrzebnymi wpisami. Inspiracją były zalecenia dokumentacji Docker oraz akcji docker/metadata-action.
 
-**Uzasadnienie:**  
-Zgodnie z dobrymi praktykami opisanymi w dokumentacji Docker i GitHub, niezmienne tagi (oparte na skrócie commita) umożliwiają odtworzenie dokładnego obrazu, podczas gdy `latest` pełni rolę wygodnego wskaźnika dla środowisk deweloperskich. Rezygnacja z tagów opartych na nazwie gałęzi (poza `main`) zapobiega zaśmiecaniu rejestru niepotrzebnymi wpisami. Źródło: [Docker Tag Best Practices](https://docs.docker.com/build/building/tagging/) oraz [docker/metadata-action docs](https://github.com/docker/metadata-action#usage).
+## Cache warstw
 
----
+Cache jest przechowywany w publicznym repozytorium na DockerHub: `lukaszp29/cache-zad2`. Używam tagu `cache`, który przy każdym budowaniu jest nadpisywany.
 
-### Strategia cache’owania
-Cache warstw budowania przechowywany jest w publicznym repozytorium DockerHub (`lukaszp29/cache-zad2`) pod stałym tagiem `cache`. Zastosowano:
+- **Eksporter registry** – dane cache zapisywane są bezpośrednio w rejestrze DockerHub, bez potrzeby stawiania własnego serwera cache.
+- **Tryb max** – eksportowane są wszystkie warstwy pośrednie, nie tylko ostateczny obraz. Dzięki temu przy kolejnych kompilacjach Buildx może ponownie wykorzystać dużo więcej danych, nawet jeśli coś w Dockerfile się zmieni.
 
-- **Eksporter:** `type=registry` – dane cache zapisywane są bezpośrednio w rejestrze kontenerów, co nie wymaga dodatkowej infrastruktury.
-- **Backend:** `mode=max` – eksportuje wszystkie warstwy pośrednie (nie tylko końcowego obrazu), co maksymalizuje współczynnik trafień cache przy kolejnych buildach.
+Zastosowanie `mode=max` w połączeniu z backendem registry jest rekomendowane przez dokumentację Docker Buildx dla środowisk CI/CD – znacząco skraca czas budowania, co było widać już przy drugim uruchomieniu pipeline’u.
 
-Każde uruchomienie pipeline’u nadpisuje tag `cache`, dzięki czemu zawsze dostępny jest najświeższy zestaw warstw. Działa to jednocześnie dla obu architektur, ponieważ Buildx scala warstwy dla każdej platformy.
+## Skanowanie CVE
 
-**Uzasadnienie:**  
-Zgodnie z oficjalną dokumentacją Docker Buildx ([Cache backends](https://docs.docker.com/build/cache/backends/registry/)), backend `registry` w trybie `max` jest zalecany dla środowisk CI/CD, gdyż przechowuje pełny graf budowania i znacząco skraca czas przebudowy (nawet o 60-80% w przypadku niewielkich zmian w Dockerfile). Wybór publicznego DockerHub jako miejsca przechowywania cache jest podyktowany jego dostępnością i brakiem dodatkowych kosztów.
+Do testowania obrazu wybrałem Trivy zamiast Docker Scout, głównie dlatego, że Trivy jest całkowicie darmowy, otwarty i nie ma limitów na liczbę skanowań. W pipeline używam oficjalnej akcji `aquasecurity/trivy-action` z ustawionym filtrem `--severity CRITICAL,HIGH`. Dzięki temu, jeśli w obrazie pojawi się poważna podatność, krok kończy się błędem i cały job jest zatrzymywany – obraz nie trafia do ghcr.io. Docker Scout w planie free narzuca ograniczenia, co mogłoby utrudnić spełnienie wymagań zadania.
 
----
+## Konfiguracja i uruchomienie
 
-### Test CVE – wybór narzędzia
-Do skanowania podatności wykorzystano **Trivy** (Aqua Security).  
-**Dlaczego Trivy, a nie Docker Scout?**
-- Trivy jest w pełni darmowy i otwartoźródłowy, nie nakłada limitów na liczbę skanowań.
-- Posiada oficjalną akcję GitHub Actions (`aquasecurity/trivy-action`), co upraszcza integrację.
-- Umożliwia precyzyjne filtrowanie podatności według poziomu krytyczności (`--severity CRITICAL,HIGH`) i zwraca niezerowy kod wyjścia, co natychmiast przerywa pipeline.
-Docker Scout w planie free ma ograniczenia, które mogłyby utrudnić realizację testu. Źródło: [Trivy GitHub Action](https://github.com/aquasecurity/trivy-action).
+Aby pipeline działał, trzeba:
 
----
+1. Na DockerHub założyć publiczne repozytorium `cache-zad2`.
+2. W ustawieniach repozytorium GitHub dodać sekrety:
+   - `DOCKERHUB_USERNAME` – nazwa użytkownika DockerHub
+   - `DOCKERHUB_TOKEN` – token z uprawnieniami do odczytu i zapisu
+3. Wypchnąć kod na gałąź `main` – workflow uruchomi się automatycznie.
 
-### Konfiguracja i uruchomienie
-1. Utwórz publiczne repozytorium `cache-zad2` na DockerHub.
-2. W ustawieniach repozytorium GitHub (`Settings → Secrets and variables → Actions`) dodaj dwa sekrety:
-   - `DOCKERHUB_USERNAME` – nazwa użytkownika DockerHub (np. `lukaszp29`)
-   - `DOCKERHUB_TOKEN` – token dostępu z odpowiednimi uprawnieniami
-3. Wypchnij kod na gałąź `main` – workflow `Build, Scan, and Push` uruchomi się automatycznie.
+## Potwierdzenie działania
 
----
+W zakładce **Actions** znajduje się historia udanych uruchomień. Po pomyślnym przejściu wszystkich kroków obraz jest dostępny w GitHub Packages (ghcr.io) z tagami `latest` i `sha-...`. Cache można podejrzeć w repozytorium `lukaszp29/cache-zad2` na DockerHub w tagu `cache`.
 
-###  Potwierdzenie działania
-W zakładce **Actions** znajduje się udokumentowane wykonanie workflow, które zakończyło się sukcesem. Obraz z tagami `latest` i `sha-xxxx` jest dostępny w publicznym rejestrze GitHub Packages.
-
----
-
-**Autor:** Łukasz Pisula
+Autor: Łukasz Pisula
